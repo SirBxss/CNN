@@ -107,116 +107,165 @@ class Conv(BaseLayer):
         #     return output
 
     def backward(self, error_tensor):
+        '''Updates the parameters using the optimizer and returns the error tensor for the next layer'''
+
         gradient_input = np.zeros_like(self.input_tensor)
         new_weights = np.copy(self.weights)
 
-        # Ensure stride values are integers and handle both 1D and 2D cases
-        stride_shape_0 = int(self.stride_shape[0])
-        stride_shape_1 = int(self.stride_shape[1]) if len(self.stride_shape) > 1 else 1  # Default to 1 for 1D case
+        if len(self.convolution_shape) == 3:
+            self._calculate_gradient_weights_3d(error_tensor)
+            new_weights = self._rearrange_weights(new_weights, dims=4)
+            gradient_input = self._calculate_gradient_input_3d(error_tensor, new_weights, gradient_input)
+            self._calculate_gradient_bias_3d(error_tensor)
+        elif len(self.convolution_shape) == 2:
+            self._calculate_gradient_weights_1d(error_tensor)
+            new_weights = self._rearrange_weights(new_weights, dims=3)
+            gradient_input = self._calculate_gradient_input_1d(error_tensor, new_weights, gradient_input)
+            self._calculate_gradient_bias_1d(error_tensor)
 
-        if len(self.convolution_shape) == 3:  # 2D Convolution
-            temp_gradient_weights = np.zeros(
-                (error_tensor.shape[0], self.weights.shape[0], self.weights.shape[1], self.weights.shape[2],
-                 self.weights.shape[3])
-            )
+        self._update_weights_and_biases()
 
-            padded_input = np.pad(
-                self.input_tensor,
-                ((0, 0), (0, 0),
-                 (self.convolution_shape[1] // 2, self.convolution_shape[1] // 2),
-                 (self.convolution_shape[2] // 2, self.convolution_shape[2] // 2)),
-                mode='constant'
-            )
+        return gradient_input
 
-            if self.convolution_shape[2] % 2 == 0:
-                padded_input = padded_input[:, :, :, :-1]
-            if self.convolution_shape[1] % 2 == 0:
-                padded_input = padded_input[:, :, :-1, :]
+    def _calculate_gradient_weights_3d(self, error_tensor):
+        temp_gradient_weights = np.zeros((error_tensor.shape[0], *self.weights.shape))
 
-            for batch in range(error_tensor.shape[0]):
-                for out_ch in range(error_tensor.shape[1]):
-                    temp = resample(error_tensor[batch, out_ch], error_tensor[batch, out_ch].shape[0] * stride_shape_0,
-                                    axis=0)
-                    temp = resample(temp, error_tensor[batch, out_ch].shape[1] * stride_shape_1, axis=1)
-                    temp = temp[:self.input_tensor.shape[2], :self.input_tensor.shape[3]]
+        padded_input = self._pad_input_3d()
 
-                    if stride_shape_1 > 1:
-                        temp[:, ::stride_shape_1] = 0
-                    if stride_shape_0 > 1:
-                        temp[::stride_shape_0, :] = 0
+        for batch in range(error_tensor.shape[0]):
+            for out_ch in range(error_tensor.shape[1]):
+                upsampled_error = self._upsample_error_3d(error_tensor[batch, out_ch])
 
-                    for in_ch in range(self.input_tensor.shape[1]):
-                        temp_gradient_weights[batch, out_ch, in_ch] = correlate(padded_input[batch, in_ch], temp,
-                                                                                mode='valid')
+                for in_ch in range(self.input_tensor.shape[1]):
+                    temp_gradient_weights[batch, out_ch, in_ch] = correlate(
+                        padded_input[batch, in_ch], upsampled_error, mode='valid')
 
-            self._gradient_weights = temp_gradient_weights.sum(axis=0)
+        self.gradient_weights = temp_gradient_weights.sum(axis=0)
 
-        elif len(self.convolution_shape) == 2:  # 1D Convolution
-            temp_gradient_weights = np.zeros(
-                (error_tensor.shape[0], self.weights.shape[0], self.weights.shape[1], self.weights.shape[2])
-            )
+    def _pad_input_3d(self):
+        conv_plane_out = []
+        for batch in range(self.input_tensor.shape[0]):
+            ch_conv_out = []
+            for out_ch in range(self.input_tensor.shape[1]):
+                padded_channel = np.pad(
+                    self.input_tensor[batch, out_ch],
+                    ((self.convolution_shape[1] // 2, self.convolution_shape[1] // 2),
+                     (self.convolution_shape[2] // 2, self.convolution_shape[2] // 2)),
+                    mode='constant')
 
-            padded_input = np.pad(
-                self.input_tensor,
-                ((0, 0), (0, 0),
-                 (self.convolution_shape[1] // 2, self.convolution_shape[1] // 2)),
-                mode='constant'
-            )
+                if self.convolution_shape[2] % 2 == 0:
+                    padded_channel = padded_channel[:, :-1]
+                if self.convolution_shape[1] % 2 == 0:
+                    padded_channel = padded_channel[:-1, :]
 
-            if self.convolution_shape[1] % 2 == 0:
-                padded_input = padded_input[:, :, :-1]
+                ch_conv_out.append(padded_channel)
 
-            for batch in range(error_tensor.shape[0]):
-                for out_ch in range(error_tensor.shape[1]):
-                    temp = resample(error_tensor[batch, out_ch], error_tensor[batch, out_ch].shape[0] * stride_shape_0,
-                                    axis=0)
-                    temp = temp[:self.input_tensor.shape[2]]
+            conv_plane = np.stack(ch_conv_out, axis=0)
+            conv_plane_out.append(conv_plane)
 
-                    if stride_shape_0 > 1:
-                        temp[::stride_shape_0] = 0
+        return np.stack(conv_plane_out, axis=0)
 
-                    for in_ch in range(self.input_tensor.shape[1]):
-                        temp_gradient_weights[batch, out_ch, in_ch] = correlate(padded_input[batch, in_ch], temp,
-                                                                                mode='valid')
+    def _upsample_error_3d(self, error):
+        temp = resample(error, error.shape[0] * self.stride_shape[0], axis=0)
+        temp = resample(temp, error.shape[1] * self.stride_shape[1], axis=1)
+        temp = temp[:self.input_tensor.shape[2], :self.input_tensor.shape[3]]
 
-            self._gradient_weights = temp_gradient_weights.sum(axis=0)
+        if self.stride_shape[1] > 1:
+            temp[:, 1::self.stride_shape[1]] = 0
+        if self.stride_shape[0] > 1:
+            temp[1::self.stride_shape[0], :] = 0
 
-        new_weights = np.transpose(new_weights, (1, 0, 2, 3)) if len(self.convolution_shape) == 3 else np.transpose(
-            new_weights, (1, 0, 2))
+        return temp
 
+    def _calculate_gradient_input_3d(self, error_tensor, new_weights, gradient_input):
         for batch in range(error_tensor.shape[0]):
             for out_ch in range(new_weights.shape[0]):
                 ch_conv_out = []
-
                 for in_ch in range(new_weights.shape[1]):
-                    temp = resample(error_tensor[batch, in_ch], error_tensor[batch, in_ch].shape[0] * stride_shape_0,
-                                    axis=0)
-                    if len(self.convolution_shape) == 3:
-                        temp = resample(temp, error_tensor[batch, in_ch].shape[1] * stride_shape_1, axis=1)
-                        temp = temp[:self.input_tensor.shape[2], :self.input_tensor.shape[3]]
-                    elif len(self.convolution_shape) == 2:
-                        temp = temp[:self.input_tensor.shape[2]]
-
-                    if stride_shape_1 > 1 and len(self.convolution_shape) == 3:
-                        temp[:, ::stride_shape_1] = 0
-                    if stride_shape_0 > 1:
-                        temp[::stride_shape_0] = 0
-
-                    ch_conv_out.append(convolve(temp, new_weights[out_ch, in_ch], mode='same', method='direct'))
+                    upsampled_error = self._upsample_error_3d(error_tensor[batch, in_ch])
+                    convolved = convolve(
+                        upsampled_error, new_weights[out_ch, in_ch], mode='same', method='direct')
+                    ch_conv_out.append(convolved)
 
                 gradient_input[batch, out_ch] = np.sum(ch_conv_out, axis=0)
 
-        if len(self.convolution_shape) == 3:
-            self._gradient_bias = np.sum(error_tensor, axis=(0, 2, 3))
-        elif len(self.convolution_shape) == 2:
-            self._gradient_bias = np.sum(error_tensor, axis=(0, 2))
+        return gradient_input
 
-        if self._optimizer:
-            self.weights = self._optimizer.calculate_update(self.weights, self._gradient_weights)
-        if self._bias_optimizer:
-            self.bias = self._bias_optimizer.calculate_update(self.bias, self._gradient_bias)
+    def _calculate_gradient_bias_3d(self, error_tensor):
+        self.gradient_bias = np.sum(error_tensor, axis=(0, 2, 3))
+
+    def _calculate_gradient_weights_1d(self, error_tensor):
+        temp_gradient_weights = np.zeros((error_tensor.shape[0], *self.weights.shape))
+
+        padded_input = self._pad_input_1d()
+
+        for batch in range(error_tensor.shape[0]):
+            for out_ch in range(error_tensor.shape[1]):
+                upsampled_error = self._upsample_error_1d(error_tensor[batch, out_ch])
+
+                for in_ch in range(self.input_tensor.shape[1]):
+                    temp_gradient_weights[batch, out_ch, in_ch] = correlate(
+                        padded_input[batch, in_ch], upsampled_error, mode='valid')
+
+        self.gradient_weights = temp_gradient_weights.sum(axis=0)
+
+    def _pad_input_1d(self):
+        conv_plane_out = []
+        for batch in range(self.input_tensor.shape[0]):
+            ch_conv_out = []
+            for out_ch in range(self.input_tensor.shape[1]):
+                padded_channel = np.pad(
+                    self.input_tensor[batch, out_ch],
+                    (self.convolution_shape[1] // 2, self.convolution_shape[1] // 2),
+                    mode='constant')
+
+                if self.convolution_shape[1] % 2 == 0:
+                    padded_channel = padded_channel[:-1]
+
+                ch_conv_out.append(padded_channel)
+
+            conv_plane = np.stack(ch_conv_out, axis=0)
+            conv_plane_out.append(conv_plane)
+
+        return np.stack(conv_plane_out, axis=0)
+
+    def _upsample_error_1d(self, error):
+        temp = resample(error, error.shape[0] * self.stride_shape[0], axis=0)
+        temp = temp[:self.input_tensor.shape[2]]
+
+        if self.stride_shape[0] > 1:
+            temp[1::self.stride_shape[0]] = 0
+
+        return temp
+
+    def _calculate_gradient_input_1d(self, error_tensor, new_weights, gradient_input):
+        for batch in range(error_tensor.shape[0]):
+            for out_ch in range(new_weights.shape[0]):
+                ch_conv_out = []
+                for in_ch in range(new_weights.shape[1]):
+                    upsampled_error = self._upsample_error_1d(error_tensor[batch, in_ch])
+                    convolved = convolve(
+                        upsampled_error, new_weights[out_ch, in_ch], mode='same', method='direct')
+                    ch_conv_out.append(convolved)
+
+                gradient_input[batch, out_ch] = np.sum(ch_conv_out, axis=0)
 
         return gradient_input
+
+    def _calculate_gradient_bias_1d(self, error_tensor):
+        self.gradient_bias = np.sum(error_tensor, axis=(0, 2))
+
+    def _rearrange_weights(self, weights, dims):
+        if dims == 4:  # 3D Convolution
+            return np.transpose(weights, (1, 0, 2, 3))
+        elif dims == 3:  # 1D Convolution
+            return np.transpose(weights, (1, 0, 2))
+
+    def _update_weights_and_biases(self):
+        if self._optimizer:
+            self.weights = self._optimizer.calculate_update(self.weights, self.gradient_weights)
+        if self._bias_optimizer:
+            self.bias = self._bias_optimizer.calculate_update(self.bias, self.gradient_bias)
 
     def initialize(self, weights_initializer, bias_initializer):
         self.weights = weights_initializer.initialize(self.weights.shape, np.prod(self.convolution_shape), np.prod(self.convolution_shape[1:]) * self.num_kernels)

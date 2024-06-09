@@ -36,12 +36,9 @@ class NeuralNetwork:
             error_tensor = layer.backward(error_tensor)
 
     def append_layer(self, layer):
-        if self.weights_initializer is not None or self.bias_initializer is not None:
-            layer.initialize(self.weights_initializer, self.bias_initializer)
-
         if layer.trainable:
             layer.optimizer = deepcopy(self.optimizer)
-
+            layer.initialize(self.weights_initializer, self.bias_initializer)
         self.layers.append(layer)
 
     def train(self, iterations):
